@@ -20,6 +20,10 @@ warnings.filterwarnings('ignore')
 # Initialize colorama
 init(autoreset=True)
 
+# Global flag to indicate if Flask server is running
+FLASK_SERVER_RUNNING = threading.Event()
+FLASK_APP_INSTANCE = None # To hold the Flask app instance for potential shutdown
+
 # ============================================
 # RESPONSE CATEGORIZATION KEYWORDS
 # ============================================
@@ -205,7 +209,7 @@ class ExactStripeChecker:
         
         # Test connection only if not running from Flask (to avoid repeated calls)
         # This check is simplified; for a robust solution, consider a global flag or explicit parameter
-        if not hasattr(sys, '_called_from_flask'):
+        if not FLASK_SERVER_RUNNING.is_set(): # Only test connection if Flask is not already running
             self.test_connection()
     
     def test_connection(self):
@@ -760,10 +764,15 @@ def exact_main_menu():
         print(f"{Fore.CYAN}1. Start Exact Categorizer (CLI Mode)")
         print(f"{Fore.CYAN}2. Clean Combo File")
         print(f"{Fore.CYAN}3. Test Connection")
-        print(f"{Fore.CYAN}4. Start API Server (Flask Mode)")
-        print(f"{Fore.CYAN}5. Exit")
+        if FLASK_SERVER_RUNNING.is_set():
+            print(f"{Fore.GREEN}4. API Server is RUNNING (http://{FLASK_APP_HOST}:{FLASK_APP_PORT})")
+            print(f"{Fore.RED}5. Stop API Server")
+            print(f"{Fore.CYAN}6. Exit")
+        else:
+            print(f"{Fore.CYAN}4. Start API Server (Flask Mode)")
+            print(f"{Fore.CYAN}5. Exit")
         
-        choice = input(f"\n{Fore.GREEN}Select option (1-5): {Fore.WHITE}").strip()
+        choice = input(f"\n{Fore.GREEN}Select option: {Fore.WHITE}").strip()
         
         if choice == '1':
             start_exact_checker_cli()
@@ -772,8 +781,17 @@ def exact_main_menu():
         elif choice == '3':
             test_stripe()
         elif choice == '4':
-            start_flask_server()
+            if FLASK_SERVER_RUNNING.is_set():
+                print(f"{Fore.YELLOW}API server is already running.")
+            else:
+                start_flask_server_threaded()
         elif choice == '5':
+            if FLASK_SERVER_RUNNING.is_set(): # If API is running, this option is "Stop API Server"
+                stop_flask_server()
+            else: # If API is not running, this option is "Exit"
+                print(f"{Fore.YELLOW}👋 Goodbye!")
+                break
+        elif choice == '6' and FLASK_SERVER_RUNNING.is_set(): # This option is "Exit" when API is running
             print(f"{Fore.YELLOW}👋 Goodbye!")
             break
         else:
@@ -914,6 +932,8 @@ def test_stripe():
 # FLASK INTEGRATION
 # ============================================
 app = Flask(__name__)
+FLASK_APP_HOST = "0.0.0.0"
+FLASK_APP_PORT = 5000
 
 @app.route('/skbased', methods=['GET'])
 def skbased_check():
@@ -962,10 +982,6 @@ def skbased_check():
     }
     
     try:
-        # We need a dummy ProxyManager to parse the single proxy string if provided
-        # The checker itself doesn't need a rotating ProxyManager in Flask single-card mode
-        # Instead, we'll pass the parsed proxy dict directly to process_card_exact
-        
         # Instantiate checker without a file-based ProxyManager for API calls
         # The specific proxy for the request will be passed directly to process_card_exact
         checker = ExactStripeChecker(sk=sk, pk=pk)
@@ -988,39 +1004,81 @@ def skbased_check():
         print(f"{Fore.RED}❌ API Error: {e}")
         return jsonify({'error': f'An internal server error occurred: {str(e)}'}), 500
 
-def start_flask_server():
-    """Starts the Flask API server."""
-    print(f"\n{Fore.GREEN}{'═' * 70}")
-    print(f"{Fore.YELLOW}🚀 STARTING FLASK API SERVER")
-    print(f"{Fore.GREEN}{'═' * 70}")
-    host = input(f"{Fore.CYAN}Enter host (default: 0.0.0.0): {Fore.WHITE}").strip() or "0.0.0.0"
-    port = input(f"{Fore.CYAN}Enter port (default: 5000): {Fore.WHITE}").strip() or "5000"
+def run_flask_app():
+    """Function to run the Flask app, intended for a separate thread."""
+    global FLASK_SERVER_RUNNING, FLASK_APP_INSTANCE
+    FLASK_SERVER_RUNNING.set()
+    FLASK_APP_INSTANCE = app # Store the app instance
     try:
-        port = int(port)
-    except ValueError:
-        print(f"{Fore.RED}❌ Invalid port, defaulting to 5000.")
-        port = 5000
-    
-    print(f"{Fore.GREEN}🌐 API server running on http://{host}:{port}")
-    print(f"{Fore.CYAN}Endpoint: /skbased?cc=CARD|MM|YY|CVV&sk=sk_live_...&pk=pk_live_...&proxy=host:port:user:pass")
-    print(f"{Fore.YELLOW}Press Ctrl+C to stop the server.")
-    
-    # Set a flag to indicate Flask is running, to prevent test_connection in checker init
-    sys._called_from_flask = True 
-    
-    try:
-        app.run(host=host, port=port, debug=False) # debug=False for production use
+        app.run(host=FLASK_APP_HOST, port=FLASK_APP_PORT, debug=False, use_reloader=False) # use_reloader=False is crucial for threading
     except Exception as e:
-        print(f"{Fore.RED}❌ Failed to start Flask server: {e}")
+        print(f"{Fore.RED}❌ Flask server thread error: {e}")
     finally:
-        if hasattr(sys, '_called_from_flask'):
-            del sys._called_from_flask # Clean up the flag
+        FLASK_SERVER_RUNNING.clear()
+        FLASK_APP_INSTANCE = None
+
+def start_flask_server_threaded():
+    """Starts the Flask API server in a separate thread."""
+    if FLASK_SERVER_RUNNING.is_set():
+        print(f"{Fore.YELLOW}API server is already running.")
+        return
+
+    print(f"\n{Fore.GREEN}{'═' * 70}")
+    print(f"{Fore.YELLOW}🚀 STARTING FLASK API SERVER IN BACKGROUND")
+    print(f"{Fore.GREEN}{'═' * 70}")
+    
+    # You can prompt for host/port here if you want to make them configurable
+    # For now, using global defaults.
+    
+    server_thread = threading.Thread(target=run_flask_app, daemon=True)
+    server_thread.start()
+    
+    # Give the server a moment to start up
+    time.sleep(1) 
+    
+    if FLASK_SERVER_RUNNING.is_set():
+        print(f"{Fore.GREEN}🌐 API server running on http://{FLASK_APP_HOST}:{FLASK_APP_PORT}")
+        print(f"{Fore.CYAN}Endpoint: /skbased?cc=CARD|MM|YY|CVV&sk=sk_live_...&pk=pk_live_...&proxy=host:port:user:pass")
+        print(f"{Fore.YELLOW}You can now use the menu while the API runs in the background.")
+    else:
+        print(f"{Fore.RED}❌ Failed to start Flask server.")
+
+def stop_flask_server():
+    """Stops the Flask API server."""
+    global FLASK_SERVER_RUNNING, FLASK_APP_INSTANCE
+    if not FLASK_SERVER_RUNNING.is_set():
+        print(f"{Fore.YELLOW}API server is not running.")
+        return
+
+    print(f"{Fore.YELLOW}Attempting to stop Flask API server...")
+    try:
+        # This is a common way to shut down a Flask app running in a thread.
+        # It sends a request to a special endpoint that triggers a shutdown.
+        requests.post(f'http://{FLASK_APP_HOST}:{FLASK_APP_PORT}/shutdown')
+        FLASK_SERVER_RUNNING.clear()
+        FLASK_APP_INSTANCE = None
+        print(f"{Fore.GREEN}Flask API server stopped.")
+    except Exception as e:
+        print(f"{Fore.RED}❌ Error stopping Flask server: {e}")
+
+# Add a shutdown route for the Flask app
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with the Werkzeug Server')
+    func()
+    return 'Server shutting down...'
 
 # ============================================
 # MAIN
 # ============================================
 if __name__ == "__main__":
     try:
+        # Start the Flask API server by default in a separate thread
+        start_flask_server_threaded()
+        
+        # Then display the main menu
         exact_main_menu()
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}👋 Stopped by user")
@@ -1028,4 +1086,8 @@ if __name__ == "__main__":
         print(f"\n{Fore.RED}❌ An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # Ensure Flask server is stopped if it was running
+        if FLASK_SERVER_RUNNING.is_set():
+            stop_flask_server()
 
